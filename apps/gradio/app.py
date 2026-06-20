@@ -432,7 +432,7 @@ def build_demo(gr, app_config, app_service) -> "gr.Blocks":
 
     show_prompt_preset = bool(app_config.prompt_presets)
 
-    with gr.Blocks(title="dots.tts") as demo:
+    with gr.Blocks(title="dots.tts", theme=build_playground_theme(gr)) as demo:
         gr.HTML(
             "<style>\n"
             + PLAYGROUND_CSS
@@ -592,6 +592,98 @@ def build_demo(gr, app_config, app_service) -> "gr.Blocks":
     return demo.queue(default_concurrency_limit=1, max_size=8)
 
 
+def _patch_gradio_range_response() -> None:
+    """Fix gradio's off-by-one when serving Range requests for short audio.
+
+    ``gradio.ranged_response.OpenRange.clamp`` treats the upper bound as an
+    inclusive byte index, so a browser ``Range: bytes=0-<chunk>`` whose end is
+    >= the file size yields ``Content-Length = file_size + 1``. The extra byte is
+    never produced; the response stalls in an empty-chunk loop, and when the
+    client aborts uvicorn/h11 raises
+    ``LocalProtocolError: Too little data for declared Content-Length``. Short
+    reference-audio clips are smaller than the player's range chunk, so this
+    fires on essentially every prompt-audio upload. Clamp the inclusive end to
+    ``file_size - 1`` to restore the correct Content-Length.
+    """
+    from gradio import ranged_response
+
+    def clamp(self, start: int, end: int):
+        # `end` is the file size (an exclusive bound); last valid index is end-1.
+        last = end - 1
+        begin = max(self.start, start)
+        finish = self.end if self.end is not None else last
+        finish = min(finish, last)
+        begin = min(begin, finish)
+        return ranged_response.ClosedRange(begin, finish)
+
+    ranged_response.OpenRange.clamp = clamp
+
+
+def _patch_audio_file_response() -> None:
+    """Make prompt/preset audio re-uploads display reliably and silence aborts.
+
+    gradio serves prompt/preset/output audio through starlette's
+    ``FileResponse`` and gradio's ``RangedFileResponse``. Two problems hit the
+    reference-audio widget on Windows:
+
+    1. **Stale browser cache (the "re-upload doesn't show" bug).** starlette
+       tags each audio response with an ``ETag`` and the file's (years-old)
+       ``Last-Modified`` but *no* ``Cache-Control``. Chrome then applies
+       heuristic freshness (~10% of file age), caching the clip for *months*.
+       gradio de-duplicates uploads by content hash, so re-uploading the same
+       clip resolves to the *same* ``/file=`` URL — and the browser replays its
+       cached copy without revalidating. Once that cache entry is poisoned (e.g.
+       a previous fetch was aborted), the waveform stays blank through clears,
+       re-uploads, and even a full ``F5`` (which does not bypass heuristic
+       cache); only the widget's own cache-busting refresh recovers it. Send
+       ``Cache-Control: no-store`` on audio responses so every fetch is fresh.
+
+    2. **Aborted in-flight fetch.** The waveform preview fetches the whole file
+       with no ``Range`` header (``FileResponse._handle_simple``). When the
+       browser swaps the prompt audio it abandons the still-in-flight GET, and
+       the half-sent response trips ``h11`` with
+       ``LocalProtocolError: Too little data for declared Content-Length`` (or a
+       raw connection reset), logged as a full ASGI traceback on every change.
+       Treat that abort family as a normal client disconnect: log at debug.
+    """
+    import starlette.responses as starlette_responses
+    from gradio import ranged_response
+    from h11 import LocalProtocolError
+    from loguru import logger
+
+    # ConnectionError covers ConnectionReset/Aborted/BrokenPipe raised by the
+    # transport when the peer goes away mid-stream.
+    abort_errors = (LocalProtocolError, ConnectionError)
+
+    def wrap_call(response_cls) -> None:
+        if getattr(response_cls, "_dots_tts_audio_safe", False):
+            return
+        original_call = response_cls.__call__
+
+        async def safe_call(self, scope, receive, send):
+            media_type = str(getattr(self, "media_type", "") or "")
+            if media_type.startswith("audio/"):
+                # Force a fresh fetch instead of replaying months-old heuristic
+                # cache; the prompt audio changes whenever the user re-uploads.
+                self.headers["cache-control"] = "no-store"
+            try:
+                await original_call(self, scope, receive, send)
+            except abort_errors as error:
+                logger.debug(
+                    "Ignored aborted file response for {} ({}): {}",
+                    getattr(self, "path", "?"),
+                    type(error).__name__,
+                    error,
+                )
+
+        safe_call._dots_tts_audio_safe = True
+        response_cls.__call__ = safe_call
+        response_cls._dots_tts_audio_safe = True
+
+    wrap_call(starlette_responses.FileResponse)
+    wrap_call(ranged_response.RangedFileResponse)
+
+
 def main() -> None:
     args = parse_args()
     import gradio as gr
@@ -600,6 +692,8 @@ def main() -> None:
     from apps.gradio.service import GradioAppService, build_gradio_app_config
     from dots_tts.utils.logging import configure_logging
 
+    _patch_gradio_range_response()
+    _patch_audio_file_response()
     configure_logging(log_file=args.log_file)
     logger.info(
         "Gradio app starting: host={} port={} model_name_or_path={} output_dir={} "
@@ -654,8 +748,7 @@ def main() -> None:
     demo.launch(
         server_name=app_config.host,
         server_port=app_config.port,
-        theme=build_playground_theme(gr),
-        css=PLAYGROUND_CSS,
+        inbrowser=os.environ.get("DOTS_TTS_OPEN_BROWSER", "0") == "1",
     )
 
 
