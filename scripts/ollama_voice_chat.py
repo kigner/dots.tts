@@ -48,11 +48,23 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def stream_ollama_chat(host: str, model: str, messages: list[dict]):
-    """Yield text deltas from a local Ollama chat stream (multi-turn, no extra deps)."""
-    payload = json.dumps({"model": model, "messages": messages, "stream": True}).encode(
-        "utf-8"
-    )
+def stream_ollama_chat(host: str, model: str, messages: list[dict],
+                       temperature: float = 0.3):
+    """Yield text deltas from a local Ollama chat stream (multi-turn, no extra deps).
+
+    A low ``temperature`` matters for factual recall: at Ollama's API default (0.8)
+    even a neutral prompt only answers correctly ~2/3 of the time, so the assistant
+    feels flaky compared to a fresh ``ollama run``. Lower temperature -> far more
+    reliable recall (temperature=0 was 3/3 correct in testing).
+    """
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": {"temperature": temperature},
+        }
+    ).encode("utf-8")
     req = urllib.request.Request(
         f"{host}/api/chat", data=payload, headers={"Content-Type": "application/json"}
     )
@@ -218,6 +230,13 @@ def main(argv=None):
     parser.add_argument("--ollama-host", default="http://localhost:11434")
     parser.add_argument("--ollama-model", default="qwen2.5:1.5b")
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.3,
+        help="LLM sampling temperature. Lower = more reliable factual recall; "
+        "Ollama's 0.8 default is flaky. Use 0 for deterministic answers.",
+    )
     parser.add_argument("--prompt-audio", default=None, help="Reference wav for voice")
     parser.add_argument("--num-steps", type=int, default=4)
     parser.add_argument("--guidance-scale", type=float, default=1.2)
@@ -292,7 +311,8 @@ def main(argv=None):
             print("助手 > ", end="", flush=True)
             t0 = time.time()
             text_stream = stream_ollama_chat(
-                args.ollama_host, args.ollama_model, messages
+                args.ollama_host, args.ollama_model, messages,
+                temperature=args.temperature,
             )
             reply = speak_reply(
                 runtime,
