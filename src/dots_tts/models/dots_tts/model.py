@@ -28,6 +28,24 @@ from dots_tts.utils.tokenizer import AUDIO_GEN_START_TOKEN, require_token_id
 from dots_tts.utils.util import get_dtype
 
 
+# Exceptions that mean torch.compile / TorchInductor could not actually build a
+# kernel at call time -- most commonly because the target machine has no C++
+# toolchain (MSVC cl.exe + Windows SDK) for Inductor/Triton to invoke. When a
+# portable bundle runs with --optimize on such a machine we want a transparent
+# eager fallback instead of a hard crash. BackendCompilerFailed and graph-break
+# (Unsupported with fullgraph=True) both subclass TorchDynamoException; OSError
+# covers a bare "compiler not found" surfacing from a subprocess.
+try:
+    from torch._dynamo.exc import TorchDynamoException as _TorchDynamoException
+
+    _COMPILE_FALLBACK_ERRORS: tuple[type[BaseException], ...] = (
+        _TorchDynamoException,
+        OSError,
+    )
+except Exception:  # pragma: no cover - dynamo internals moved/renamed
+    _COMPILE_FALLBACK_ERRORS = (RuntimeError, OSError)
+
+
 @dataclass
 class _GenerateState:
     llm_cache: Any | None = None
@@ -357,11 +375,16 @@ class DotsTtsModel(nn.Module):
                 if key == "patch_encoder.decode_patch"
                 else "reduce-overhead"
             )
-            compiled = torch.compile(
+            compiled_fn = torch.compile(
                 model,
                 mode=mode,
                 fullgraph=True,
                 dynamic=False,
+            )
+            compiled = self._guard_compiled_callable(
+                key,
+                eager=model,
+                compiled=compiled_fn,
             )
             self._compiled_models[cache_key] = compiled
             logger.info(
@@ -371,6 +394,45 @@ class DotsTtsModel(nn.Module):
                 signature,
             )
         return compiled
+
+    def _guard_compiled_callable(
+        self,
+        key: str,
+        *,
+        eager: Callable[..., Any],
+        compiled: Callable[..., Any],
+    ) -> Callable[..., Any]:
+        """Wrap a compiled callable with a one-shot eager fallback.
+
+        torch.compile is lazy: a missing C++ toolchain only blows up the first
+        time the compiled callable is actually invoked (during warmup, or during
+        real generation when ``--no-warmup`` is used). If that happens we log
+        once, flip the whole model back to eager via ``set_optimize(False)``
+        (which also clears the compiled cache, so later ``_get_compiled_*``
+        lookups return raw eager callables), and re-run the call eagerly. The
+        ``_optimize_enabled`` guard short-circuits any stale wrappers still held
+        by a caller's local after the flip.
+        """
+
+        def _runner(*args: Any, **kwargs: Any) -> Any:
+            if not self._optimize_enabled:
+                return eager(*args, **kwargs)
+            try:
+                return compiled(*args, **kwargs)
+            except _COMPILE_FALLBACK_ERRORS as exc:
+                logger.warning(
+                    "torch.compile failed for target={}; disabling --optimize "
+                    "and falling back to eager for the rest of this run. This "
+                    "usually means no C++ compiler (MSVC cl.exe + Windows SDK) "
+                    "is available on this machine. Underlying error: {}: {}",
+                    key,
+                    type(exc).__name__,
+                    exc,
+                )
+                self.set_optimize(False)
+                return eager(*args, **kwargs)
+
+        return _runner
 
     def _get_compiled_model(
         self,
