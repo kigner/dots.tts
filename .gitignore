@@ -33,3 +33,11 @@ apps/gradio/*.log
 *wav
 !apps/gradio/default_prompts/
 !apps/gradio/default_prompts/*.wav
+
+# Windows portable bundle (整合包) — heavy / local-only, never commit
+python-3.11.9/
+hf_cache/
+pack/
+get-pip.py
+.codegraph/
+.cursor/
